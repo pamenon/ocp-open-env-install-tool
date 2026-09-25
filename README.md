@@ -45,9 +45,8 @@ This OCP installation includes a rich set of optional Day 2 components deployed 
    ls pull-secret.txt   # verify it exists
    ```
 3. Clone this project. Go to Quick Start Step 1
-4. Download your pull secret from [console.redhat.com](https://console.redhat.com/openshift/install) and place it in the project root:
-   * Create `config/common.config` and `config/<profile>.config` and fill them with information from prerequisite 1. 
-5. Make sure you have those CLI tools installed: `oc`, `git`, `yq`, `podman`, `aws`
+4. Make sure you create `config/common.config` and `config/<profile>.config` and fill them with information from prerequisite 1, following step 3 in the quick start. 
+5. Make sure you have those CLI tools installed: `oc`, `git`, `yq`, `podman`, `aws`, step 4 in the quick start
 6. *(If forked)* Update ' GIT_REPO_URL ' in `config/common.config`
 
 ---
