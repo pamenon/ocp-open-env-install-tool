@@ -1,8 +1,8 @@
 # OpenShift Container Platform setup on Red Hat Demo Platform Open Environment Lab for Red Hat Consulting team
 
-The purpose of this project is to help the Red Hat Consulting team quickly setup an OpenShift cluster using an AWS Blank Open Environment [Red Hat Demo Platform](https://demo.redhat.com) item.
+This project helps the Red Hat Consulting team quickly set up an OpenShift cluster using an AWS Blank Open Environment [Red Hat Demo Platform](https://demo.redhat.com) item.
 
-It supports both **IPI (Installer-Provisioned Infrastructure)** and **UPI (User-Provisioned Infrastructure)** methods for installation on AWS.
+It supports both **IPI (Installer-Provisioned Infrastructure)** and **UPI (User-Provisioned Infrastructure)** installation methods on AWS.
 
 The entire installation process, including Day 2 configuration, takes about 1 hour or more.
 
@@ -12,9 +12,9 @@ This OCP installation includes a rich set of optional Day 2 components deployed 
 * **Observability:** Logging (Pico, Small, Medium), Loki, Monitoring, Tempo, OpenTelemetry, Network Observability (with or without Loki).
 * **Security:** Red Hat Advanced Cluster Security (ACS) - Central or Secured Cluster modes.
 * **Management:** Red Hat Advanced Cluster Management (ACM) - Hub or Managed modes.
-* **AI/ML:** Red Hat OpenShift AI (RHOAI), Nvidia GPU Operator, Kueue.
+* **AI/ML:** Red Hat OpenShift AI (RHOAI), NVIDIA GPU Operator, Kueue.
 * **CI/CD:** OpenShift GitOps, Pipelines, Builds.
-* **Utilities:** cert-manager, Sealed Secrets, WebTerminal, Node Feature Discovery, AWS Controllers for Kubernetes (ACK) Route53.
+* **Utilities:** cert-manager, Sealed Secrets, WebTerminal, Node Feature Discovery, AWS Controllers for Kubernetes (ACK), Route53.
 
 ---
 
@@ -32,6 +32,23 @@ This OCP installation includes a rich set of optional Day 2 components deployed 
     * **Zero-Trust Network Isolation:** AdminNetworkPolicy + BaselineAdminNetworkPolicy for namespace-level network security.
     * **Secrets Management:** AWS Secrets Manager integration for credential handling.
     * **Air-Gap Compatible:** Uses Red Hat registry images exclusively.
+
+---
+
+## 📦 Prerequisites
+
+1. An active **AWS Blank Open Environment** from [Red Hat Demo Platform](https://catalog.demo.redhat.com/catalog/all?search=AWS+Blank+Open+Environment)
+2. Download your pull secret from [console.redhat.com](https://console.redhat.com/openshift/install) and place it in the project root:
+
+   ```bash
+   The file must be named exactly pull-secret.txt at the project root
+   ls pull-secret.txt   # verify it exists
+   ```
+3. Clone this project. Go to Quick Start Step 1
+4. Download your pull secret from [console.redhat.com](https://console.redhat.com/openshift/install) and place it in the project root:
+   * Create `config/common.config` and `config/<profile>.config` and fill them with information from prerequisite 1. 
+5. Make sure you have those CLI tools installed: `oc`, `git`, `yq`, `podman`, `aws`
+6. *(If forked)* Update ' GIT_REPO_URL ' in `config/common.config`
 
 ---
 
@@ -96,16 +113,7 @@ Then **edit both files** with your values:
 # - RHDP_TOP_LEVEL_ROUTE53_DOMAIN → from RHDP environment (e.g. ".sandbox1234.opentlc.com")
 ```
 
-### Step 4 — Add Your Pull Secret
-
-Download your pull secret from [console.redhat.com](https://console.redhat.com/openshift/install) and place it in the project root:
-
-```bash
-# The file must be named exactly pull-secret.txt at the project root
-ls pull-secret.txt   # verify it exists
-```
-
-### Step 5 — Install CLI Tools
+### Step 4 — Install CLI Tools
 
 Ensure these tools are installed on your workstation:
 
@@ -117,23 +125,13 @@ Ensure these tools are installed on your workstation:
 | `podman` | Registry credential check | `brew install podman` |
 | `aws` | AWS CLI | `brew install awscli` |
 
-### Step 6 — Run
+### Step 5 — Run
 
 ```bash
 ./init_openshift_installation_lab_cluster.sh --config-file ocp-ai.config
 ```
 
 > The installation takes **~1 hour**. If your connection drops, re-run the same command — the script auto-resumes.
-
----
-
-## 📦 Prerequisites (Summary)
-
-* An active **AWS Blank Open Environment** from [Red Hat Demo Platform](https://demo.redhat.com)
-* `pull-secret.txt` in the project root
-* `config/common.config` and `config/<profile>.config` created and filled in
-* CLI tools: `oc`, `git`, `yq`, `podman`, `aws`
-* *(If forked)* `GIT_REPO_URL` updated in `config/common.config`
 
 ---
 
@@ -232,7 +230,7 @@ Bash
 
 ### **🧹 Clean AWS Tenant (`clean_aws_tenant.sh`)**
 
-This script is automatically called by the init script but can be run manually to force-clean resources related to a cluster name in a region.
+This script is called automatically by the init script but can be run manually to force-clean resources for a cluster name in a region.
 
 ```bash
 # Usage: ./scripts/clean_aws_tenant.sh <AWS_KEY> <AWS_SECRET> <REGION> <CLUSTER_NAME> <DOMAIN>
