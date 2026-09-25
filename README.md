@@ -102,11 +102,11 @@ Then **edit both files** with your values:
 ```bash
 # In config/common.config — mandatory fields:
 # - OCP_ADMIN_PASSWORD / OCP_NON_ADMIN_PASSWORD  → cluster passwords
+# - CLUSTER_NAME         → e.g. "myocp"
 # - GIT_REPO_URL                                 → YOUR fork URL (if forked)
 # - GIT_REPO_REVISION                            → branch (default: master)
 
 # In config/ocp-ai.config — mandatory fields:
-# - CLUSTER_NAME         → e.g. "myocp"
 # - AWS_DEFAULT_REGION   → e.g. "eu-central-1"
 # - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY → from RHDP environment
 # - RHDP_TOP_LEVEL_ROUTE53_DOMAIN → from RHDP environment (e.g. ".sandbox1234.opentlc.com")
