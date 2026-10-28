@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: Force=true
+  name: mcg-bucket-models-rotation
+  namespace: ai-distributed-llm-serving
+spec:
+  template:
+    metadata:
+      name: mcg-bucket-models-rotation
+    spec:
+      containers:
+      - name: create-secret
+        image: registry.redhat.io/openshift4/ose-cli-rhel9:v4.22
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          echo "Waiting for OBC-generated secret models in ai-distributed-llm-serving..."
+          while ! oc get secret models -n ai-distributed-llm-serving &>/dev/null; do
+            sleep 5
+          done
+          echo "Secret found"
+
+          ACCESS_KEY=$(oc get secret models -n ai-distributed-llm-serving -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+          SECRET_KEY=$(oc get secret models -n ai-distributed-llm-serving -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+          BUCKET_NAME=$(oc get configmap models -n ai-distributed-llm-serving -o jsonpath='{.data.BUCKET_NAME}')
+
+          echo "Creating Data Connection secret mcg-models in ai-distributed-llm-serving..."
+          oc create secret generic mcg-models \
+            -n ai-distributed-llm-serving \
+            --from-literal=AWS_ACCESS_KEY_ID="${ACCESS_KEY}" \
+            --from-literal=AWS_SECRET_ACCESS_KEY="${SECRET_KEY}" \
+            --from-literal=AWS_S3_ENDPOINT="https://s3.openshift-storage.svc" \
+            --from-literal=AWS_DEFAULT_REGION="us-east-1" \
+            --from-literal=AWS_S3_BUCKET="${BUCKET_NAME}" \
+            --dry-run=client -o yaml \
+            | oc label -f - --local -o yaml opendatahub.io/dashboard=true opendatahub.io/managed=true \
+            | oc annotate -f - --local -o yaml opendatahub.io/connection-type=s3 opendatahub.io/connection-type-protocol=s3 \
+            | oc apply -f -
+
+          echo "✅ Secret mcg-models ready in ai-distributed-llm-serving"
+
+          echo "Creating KServe-native S3 credentials secret kserve-s3-creds in ai-distributed-llm-serving..."
+          oc create secret generic kserve-s3-creds \
+            -n ai-distributed-llm-serving \
+            --from-literal=AWS_ACCESS_KEY_ID="${ACCESS_KEY}" \
+            --from-literal=AWS_SECRET_ACCESS_KEY="${SECRET_KEY}" \
+            --dry-run=client -o yaml \
+            | oc annotate -f - --local -o yaml \
+                serving.kserve.io/s3-endpoint=s3.openshift-storage.svc \
+                serving.kserve.io/s3-region=us-east-1 \
+                serving.kserve.io/s3-useanoncredential=false \
+                serving.kserve.io/s3-usehttps=1 \
+                serving.kserve.io/s3-verifyssl=1 \
+            | oc apply -f -
+
+          echo "✅ Secret kserve-s3-creds ready in ai-distributed-llm-serving"
+
+          echo "Waiting for LLMInferenceService granite-distributed-prod in ai-distributed-llm-serving..."
+          while ! oc get llminferenceservice granite-distributed-prod -n ai-distributed-llm-serving &>/dev/null; do
+            sleep 5
+          done
+
+          echo "Patching LLMInferenceService model.uri with live bucket name..."
+          oc patch llminferenceservice granite-distributed-prod \
+            -n ai-distributed-llm-serving \
+            --type=merge \
+            -p "{\"spec\":{\"model\":{\"uri\":\"s3://${BUCKET_NAME}/granite3\"}}}"
+
+          echo "✅ LLMInferenceService model.uri patched to s3://${BUCKET_NAME}/granite3"
+      restartPolicy: Never
+      serviceAccountName: mcg-bucket-models-rotation
+  ttlSecondsAfterFinished: 600

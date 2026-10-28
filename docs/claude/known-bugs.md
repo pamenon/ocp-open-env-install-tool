@@ -2,6 +2,8 @@
 
 This document tracks known bugs in OpenShift operators and components that generate false-positive alerts. These alerts are silenced in the Alertmanager configuration to reduce noise.
 
+**Scope:** entries here are actual upstream bugs with a JIRA tracking a real fix that may eventually ship — that's what the Removal Criteria below rely on. A permanent, intentional vendor policy change (e.g. a registry retiring a tag scheme) is not a bug: there's no JIRA, nothing will be "fixed," and it will never meet the removal criteria. File those instead as a short pointer in CLAUDE.md plus a full writeup in [troubleshooting.md](troubleshooting.md) — see CLAUDE.md's "Container Image Tags" entry as the template.
+
 **⚠️ IMPORTANT: Do NOT add secrets to Alertmanager configuration!**
 
 Before adding any alert silence, verify that the Alertmanager configuration does NOT contain:
@@ -518,6 +520,8 @@ Our `cluster-api/accelerator: nvidia` label (the documented fix for [BZ#1943194]
 
 **Affects our own repo:** `components/rhoai/base/rhoai-model-registries-cm-model-catalog-sources.yaml` — our custom `Qwen3-0.6B` catalog entry uses `s3://models/Qwen3-0.6B/1.0.0/`, so this bug is hit if Deploy is attempted directly from that Catalog entry. We deploy that model via Project → Models → Deploy instead.
 
+**Re-confirmed 2026-10-14** via a repo-wide audit for hardcoded per-cluster-rebuild values: this same `s3://models/...` entry was independently flagged again as a low-confidence item worth checking. Already covered here — no new ticket needed.
+
 ---
 
 ### RHOAIENG-95447 — OGXServer operator doesn't propagate spec after a deactivate→reactivate toggle (SSA field-ownership gap)
@@ -554,7 +558,7 @@ Also independently confirmed **not** caused by ArgoCD/GitOps — the Deployment 
 
 **Precedent:** [RHOAIENG-66855](https://redhat.atlassian.net/browse/RHOAIENG-66855) (Resolved) fixed the same bug class for LLM-d's AMD/NVIDIA template auto-selection — different subsystem, confirms Red Hat has addressed this shape of gap before. [RHOAIENG-95191](https://redhat.atlassian.net/browse/RHOAIENG-95191) (In Progress) — this exact `vllm-cpu-runtime-template` separately shipped with a broken/non-existent image tag in 3.6 EA2, showing this template pairing is a recurring trouble spot.
 
-**Workaround:** always pick "vLLM CPU (x86) ServingRuntime for KServe" explicitly on this (amd64) cluster — never the plain "vLLM CPU (ppc64le/s390x)" one. Our own `components/ai-project-a/base/ai-project-a-servingruntime-qwen3-06b-100.yaml` pins the image via the versioned `3.5.0` tag — the same content Red Hat's own template ships, not an invented pin (originally pinned by the equivalent digest, switched to the tag 2026-09-17 for readability once the reasoning below was corrected). **Correction:** the `odh-vllm-cpu-rhel9:v3.5.0` manifest-list gap hit earlier in this investigation is NOT tag-instability evidence — that image is intentionally ppc64le/s390x-only and its tag resolved correctly every time; we had simply picked the wrong template. The one genuine tag-instability data point for this image family is RHOAIENG-95191 (a broken tag, but in a pre-GA 3.6 EA2 build, not GA) — a single, weaker incident than originally stated, not strong enough on its own to require digest-pinning here.
+**Workaround:** always pick "vLLM CPU (x86) ServingRuntime for KServe" explicitly on this (amd64) cluster — never the plain "vLLM CPU (ppc64le/s390x)" one. Our own `components/ai-project-a/base/ai-project-a-servingruntime-vllm-cpu-x86-runtime.yaml` pins the image via the versioned `3.5.0` tag — the same content Red Hat's own template ships, not an invented pin (originally pinned by the equivalent digest, switched to the tag 2026-09-17 for readability once the reasoning below was corrected). **Correction:** the `odh-vllm-cpu-rhel9:v3.5.0` manifest-list gap hit earlier in this investigation is NOT tag-instability evidence — that image is intentionally ppc64le/s390x-only and its tag resolved correctly every time; we had simply picked the wrong template. The one genuine tag-instability data point for this image family is RHOAIENG-95191 (a broken tag, but in a pre-GA 3.6 EA2 build, not GA) — a single, weaker incident than originally stated, not strong enough on its own to require digest-pinning here.
 
 ---
 
@@ -589,6 +593,19 @@ Also independently confirmed **not** caused by ArgoCD/GitOps — the Deployment 
 **Fix:** bump only `limits.memory` to 512Mi via `Subscription.spec.config.resources` (leave CPU at its default 500m/10m) — confirmed live: pod came up clean, `restarts=0`, stable well past the ~79s crash window.
 
 **Workaround (this repo):** `components/openshift-storage/base/openshift-gitops-job-fix-ocs-client-operator-memory-limit.yaml` — a Job (same pattern as `update-odf-subscriptions-node-selector`) that waits for the OLM-auto-created `ocs-client-operator-<channel>-...` Subscription to exist, then patches its `spec.config.resources`. This Subscription is an OLM-managed dependency of `odf-operator`, not something this repo declares directly, so the fix has to be applied this way (imperative patch after creation) rather than as a static manifest.
+
+---
+
+### RHOAIENG-97011 / RHOAIENG-97012 — vLLM CPU ServingRuntime docs missing `/dev/shm` sizing and `--gpu-memory-utilization` CPU semantics
+
+**Component:** Red Hat OpenShift AI (RHOAI) 3.5.1 — vLLM CPU ServingRuntime for KServe (`vllm-cpu-x86-runtime-template`)
+**JIRA:** [RHOAIENG-97011](https://redhat.atlassian.net/browse/RHOAIENG-97011) (`/dev/shm` sizing), [RHOAIENG-97012](https://redhat.atlassian.net/browse/RHOAIENG-97012) (`--gpu-memory-utilization` CPU semantics) — both New, filed 2026-09-29
+**Status:** Open, no fix version yet
+**Affects:** Any `InferenceService` using `vllm-cpu-x86-runtime`/`vllm-cpu-runtime` without an explicit `/dev/shm` volume or an explicit `--gpu-memory-utilization` value
+
+**Issue:** Two undocumented requirements for KServe-based vLLM CPU serving both surface as the same generic, unhelpful crash: `RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}`, with no indication of either real cause. (1) The predictor pod needs a dedicated `/dev/shm` volume larger than CRI-O's 64Mi default — documented for the standalone-container path in Red Hat AI Inference's own troubleshooting guide, but not for the KServe/`InferenceService` path. (2) `--gpu-memory-utilization`, despite its name, controls CPU memory reservation on this backend and must be set explicitly — not documented anywhere, GPU-only framing implies it's safe to omit on CPU.
+
+**Fix applied (this repo):** `components/ai-project-a/base/ai-project-a-inferenceservice-qwen3-06b-100.yaml` — full incident writeup and YAML fix in [rhoai-model-serving.md](rhoai-model-serving.md) ("vllm-cpu-x86-runtime CrashLoopBackOff — Two Real Causes, One Misleading Symptom").
 
 ---
 

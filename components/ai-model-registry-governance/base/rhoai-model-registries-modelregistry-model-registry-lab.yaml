@@ -1,0 +1,19 @@
+apiVersion: modelregistry.opendatahub.io/v1beta1
+kind: ModelRegistry
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+  name: model-registry-lab
+  namespace: rhoai-model-registries
+spec:
+  mysql:
+    database: modelregistrydb
+    host: mysql.external-db-model-registry-lab.svc.cluster.local
+    passwordSecret:
+      key: database-password
+      name: registry-db-secret
+    sslRootCertificateConfigMap:
+      key: service-ca.crt
+      name: openshift-service-ca.crt
+    username: modelregistry
+    verifyServerCert: true

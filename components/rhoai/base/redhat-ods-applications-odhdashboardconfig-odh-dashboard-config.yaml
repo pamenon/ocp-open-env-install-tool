@@ -7,6 +7,8 @@ metadata:
   namespace: redhat-ods-applications
 spec:
   dashboardConfig:
+    disableKueue: false
+    disableLMEval: false
     disableTracking: false
     genAiStudio: true
     llmGatewayField: true

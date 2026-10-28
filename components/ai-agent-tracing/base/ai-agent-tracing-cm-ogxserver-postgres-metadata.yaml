@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ogxserver-postgres-metadata
+  namespace: ai-agent-tracing
+data:
+  POSTGRES_DB: ogxservermetadatadb
+  POSTGRES_HOST: postgresql.external-db-ai-agent-tracing-ogxserver-metadata.svc.cluster.local
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ogxservermetadata

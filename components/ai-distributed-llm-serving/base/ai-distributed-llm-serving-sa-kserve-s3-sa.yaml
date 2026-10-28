@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kserve-s3-sa
+  namespace: ai-distributed-llm-serving
+secrets:
+- name: kserve-s3-creds

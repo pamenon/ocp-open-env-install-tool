@@ -64,6 +64,39 @@ For Mistral models in **HuggingFace format** (model-XXXXX.safetensors + config.j
 
 The Red Hat AI Inference Server 3.4 docs show all four args together for the `RedHatAI/Mistral-*-NVFP4` model (native Mistral format). For standard HF-format Mistral models, only the first two apply.
 
+### vllm-cpu-x86-runtime CrashLoopBackOff — Two Real Causes, One Misleading Symptom
+
+`qwen3-06b-100` (`ai-project-a`, RHOAI 3.5.1, `vllm-cpu-x86-runtime`) crash-looped with a generic, unhelpful error on every attempt: `RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}`. The captured container log was consistently only ~20-30 lines — too short to contain the actual root cause, which vLLM normally prints just above that line. **Two independent, stacked bugs**, both required to get a working deployment:
+
+**1. `/dev/shm` too small (the actual cause of the truncated, uninformative log).** The pod had no dedicated shared-memory volume, so it used CRI-O's 64Mi default — too small for vLLM's multiprocess CPU executor (API server + EngineCore run as separate processes communicating over shared memory). Fix: add a `Memory`-medium `emptyDir` at `/dev/shm`:
+```yaml
+spec:
+  predictor:
+    model:
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: dshm
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 2Gi
+      name: dshm
+```
+Once this is in place, the log gets far enough to print the *real* error — don't stop investigating just because a short, generic-looking log matches this symptom; fix `/dev/shm` first and re-check the logs before concluding anything else.
+
+**2. `--gpu-memory-utilization` is NOT GPU-only on Red Hat's vLLM CPU backend — despite the name, it controls CPU memory reservation.** This is a Red Hat AI Inference Server (`rhaiv`) build-specific behavior, not documented in upstream vLLM's CPU docs, and not discoverable without hitting the actual error text. **Do not remove this arg from a CPU `InferenceService` just because the flag name says "gpu"** — confirmed via the real error surfaced only after fixing `/dev/shm` above:
+```
+ValueError: Available memory on node 0 (6.11/8.0 GiB) on startup is less than desired CPU memory
+utilization (0.92, 7.36 GiB). On the CPU backend, the `--gpu-memory-utilization` flag controls the
+fraction of CPU memory reserved (despite its name). To resolve: decrease `--gpu-memory-utilization`
+(e.g. `--gpu-memory-utilization 0.5`) or reduce CPU memory used by other processes.
+```
+`gpu_memory_utilization` defaults to ~0.9 of the container's memory limit when omitted — on an 8Gi limit that leaves too little headroom once the model, Python/PyTorch runtime, and framework overhead are already resident. Set it explicitly (e.g. `0.5`) to leave real headroom; don't just delete it.
+
+**Rule**: on this vLLM CPU image, treat `--gpu-memory-utilization` as a required CPU memory-budget arg, not a leftover GPU flag — verify against the actual crash log (after fixing `/dev/shm` if the log looks suspiciously short) before assuming a "gpu"-named flag is safe to drop on a CPU runtime.
+
+**Documentation gap filed upstream** (2026-09-29): neither issue is documented for the KServe/`InferenceService` deployment path in RHOAI 3.5's own docs — filed as [RHOAIENG-97011](https://redhat.atlassian.net/browse/RHOAIENG-97011) (`/dev/shm` sizing) and [RHOAIENG-97012](https://redhat.atlassian.net/browse/RHOAIENG-97012) (`--gpu-memory-utilization` CPU semantics).
+
 ### HuggingFace CLI
 
 `huggingface-cli` is deprecated in newer `huggingface_hub` versions. Use `hf` instead:
@@ -108,9 +141,21 @@ Per RHOAI 3.4 doc (section "Playground prerequisites"):
 
 ---
 
-## NooBaa/MCG-Backed Data Connections — Use the Internal S3 Endpoint
+## NooBaa/MCG-Backed Data Connections — Use the Internal S3 Endpoint, HTTPS Is Also an Option
 
-For an S3-type Data Connection (or a ModelRegistry's object storage) backed by an `ObjectBucketClaim`, point `AWS_S3_ENDPOINT` at NooBaa's in-cluster gateway service — `http://s3.openshift-storage.svc` — never the external Route. The Route is signed by the cluster's self-signed default ingress cert, which fails TLS verification for S3 clients (boto3, DSPA, etc.) connecting from inside the cluster. This matches the same endpoint already used by this repo's `create-secret-logging-loki-s3`/`create-secret-netobserv-loki-s3` Jobs.
+For an S3-type Data Connection (or a ModelRegistry's object storage) backed by an `ObjectBucketClaim`, point `AWS_S3_ENDPOINT` at NooBaa's in-cluster gateway service — `s3.openshift-storage.svc` — never the external Route. The Route is signed by the cluster's self-signed default ingress cert, which fails TLS verification for S3 clients (boto3, DSPA, etc.) connecting from inside the cluster.
+
+**The internal Service itself supports real, verifiable TLS on port 443** — its cert (`CN=s3.openshift-storage.svc`) is signed by the cluster's own service-ca signer, same as every other service-ca cert cluster-wide. Confirmed live: `curl --cacert <(oc get cm odh-kserve-custom-ca-bundle -o jsonpath='{.data.cabundle\.crt}') https://s3.openshift-storage.svc` returns `SSL certificate verify ok`. `odh-kserve-custom-ca-bundle` (and the combined `odh-trusted-ca-bundle`'s `odh-ca-bundle.crt` key) are auto-propagated to every namespace cluster-wide, so any consumer that trusts the cluster's service-ca signer — explicitly via a mounted CA bundle (MLflow's CR `caBundleConfigMap` field), or implicitly via RHOAI's standard Workbench/Pipeline trusted-CA injection — gets a genuinely verified connection with `https://s3.openshift-storage.svc`, not just an encrypted-but-unverified one.
+
+**Plain `http://` is still the simplest, lowest-risk default** for a generic Data Connection Secret with no single fixed consumer (the RHOAI dashboard's S3 connection type has no CA-bundle field, so there's no way to wire explicit trust into the Secret itself — a consumer has to already trust the service-ca signer on its own, which dashboard-created Workbenches generally do but arbitrary user code might not). Use `https://` when there's a specific, verifiable consumer to confirm against (as done for MLflow); default to `http://` otherwise, matching `create-secret-logging-loki-s3`/`create-secret-netobserv-loki-s3`.
+
+### A Large Upload Can Silently Fail on a Just-Created OBC Bucket, While Small Files Succeed
+
+Immediately after an `ObjectBucketClaim` is created (e.g. right after a namespace recreation), a model-ingest script's `wait_for_bucket()`-style readiness check can pass and small file uploads (`config.json`, tokenizer files) can succeed via `boto3.upload_file()`, while a large file (a multi-hundred-MB/GB `.safetensors` weight file, uploaded as a multipart transfer) silently fails with no exception raised and no error in the Job log — the script reports `✅ SUCCESS` even though the weight file never lands in the bucket. The only symptom shows up downstream: KServe's storage-initializer lists fewer S3 objects than expected, and vLLM fails to load with a generic, unhelpful `Engine core initialization failed` error (same misleading-short-log symptom as the `vllm-cpu-x86-runtime` entry above, but with a different root cause).
+
+**Diagnosis:** check the storage-initializer's own log for `Found S3 object: ...` lines and confirm the weight file is actually listed with its real size — don't assume the ingest Job's own `SUCCESS` message proves the upload is complete.
+
+**Fix:** re-run the ingest Job once (`oc create -f` a copy of the completed Job's spec under a new name, or delete+let GitOps/Force=true recreate it) — a retry against the now-fully-provisioned bucket succeeds reliably. **Confirmed reproducible, not a one-off:** hit twice in a row during the same renaming session (2026-10-12) — `ai-model-registry-governance` (`model-registry-lab` rename) dropped the single 1.5GB `model.safetensors`; `ai-single-pod-llm-serving` (`model-deploy-lab` rename) dropped both sharded `model-0000X-of-00002.safetensors` files (~5GB total) the very next time a fresh OBC was created. Treat the first ingest run after any namespace recreation as untrusted by default — check the storage-initializer log before assuming the model loaded correctly.
 
 ---
 
@@ -179,11 +224,27 @@ spec:
 - EBS RWO = one node at a time
 - If pods land on different nodes → **Multi-Attach error** → router-scheduler stuck `ContainerCreating`
 
-**Workaround (EBS RWO):** Force co-location via `podAffinity` in `router.scheduler.template`. Requires providing full container specs because the controller uses the template as-is without merging with defaults (bug — see YAML in memory `project_llmisvc_pvc_workaround`).
+**Workaround (EBS RWO):** Force co-location via `podAffinity` in `router.scheduler.template`. Requires providing full container specs because the controller uses the template as-is without merging with defaults (bug — see "Full Working YAML — EBS RWO Co-location Workaround" below).
 
 **Clean solution:** Use RWX storage (EFS on AWS, CephFS with ODF). Standard LLMInferenceService spec then works without modification. EFS Standard is 2-3x slower at model load vs EBS gp3, but runtime inference is unaffected (model in GPU VRAM).
 
 **Recommended storage for llm-d in production:** S3 or `hf://` URI — no volume mounts, pods schedule freely on any node.
+
+### S3 Storage with an MCG/NooBaa `ObjectBucketClaim` — URI Must Be Re-synced After Namespace Recreation
+
+`spec.model.uri` for an S3-backed `LLMInferenceService` is a static, git-committed string
+(`s3://<bucket>/<path>`), but an `ObjectBucketClaim` using `generateBucketName` gets a brand-new
+random bucket name (e.g. `models--79cb8c90-...`) every time it's created — including when a
+namespace is deleted and recreated (a GitOps rename, a profile switch). The old bucket and its
+contents are gone with the old namespace; the new OBC creates an empty bucket under a different
+name that the hardcoded `model.uri` doesn't match, so the storage-initializer fails with `404
+HeadBucket ... Not Found`, even though the model-loading Job (e.g. `fasttracker`) completes
+successfully into the *new* bucket.
+
+**Fix after any namespace recreation:** read the new bucket name (`oc get obc <name> -n <ns> -o
+jsonpath='{.spec.bucketName}'`) and update `model.uri` in the component's
+`*-llminferenceservice-*.yaml` to match, then commit/push — a live-only patch won't survive
+ArgoCD `selfHeal`. Seen in `ai-distributed-llm-serving` (`llmd-deploy-lab` rename, 2026-10-12).
 
 ### `router.scheduler.template` — Controller Behavior
 
@@ -192,7 +253,168 @@ When `spec.router.scheduler.template` is provided, the controller uses it **as-i
 - ✅ `affinity`, `tolerations`, `nodeSelector` work
 - ❌ If `containers` is absent → Deployment creation fails: `spec.template.spec.containers: Required value`
 
-To use `affinity` in the scheduler template, you must also provide the full container specs. See memory entry `project_llmisvc_pvc_workaround` for the complete YAML.
+To use `affinity` in the scheduler template, you must also provide the full container specs — see "Full Working YAML — EBS RWO Co-location Workaround" below.
+
+### Full Working YAML — EBS RWO Co-location Workaround
+
+Deploying LLMInferenceService with PVC RWO storage on a GPU-tainted node (e.g. `p4d.24xlarge`) requires two non-standard sections beyond the basic spec, because EBS gp3 is RWO (one node at a time) and the llm-d controller mounts the PVC on every pod it creates — both vLLM and the router-scheduler's `tokenizer` container must land on the same node.
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    opendatahub.io/genai-use-case: chat
+    opendatahub.io/model-type: generative
+    openshift.io/display-name: mistral-medium-3-5-llmd
+    security.opendatahub.io/enable-auth: "false"
+  labels:
+    opendatahub.io/dashboard: "true"
+    opendatahub.io/genai-asset: "true"
+  name: mistral-medium-3-5-llmd
+  namespace: demo-ei
+spec:
+  model:
+    name: mistral-medium-3-5-llmd
+    uri: pvc://mistral-medium-3-5-bf16/mistral-medium-3-5
+  replicas: 1
+  router:
+    gateway:
+      refs:
+      - name: openshift-ai-inference
+        namespace: openshift-ingress
+    route: {}
+    scheduler:
+      template:
+        # NON-STANDARD: podAffinity to co-locate router-scheduler with vLLM pod (same RWO node)
+        affinity:
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: mistral-medium-3-5-llmd
+                  kserve.io/component: workload
+              topologyKey: kubernetes.io/hostname
+        # NON-STANDARD: toleration needed since p4d has nvidia.com/gpu:NoSchedule taint
+        tolerations:
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        # NON-STANDARD: full containers required — controller does NOT merge with defaults
+        containers:
+        - name: main
+          command:
+          - /app/epp
+          - --pool-name
+          - mistral-medium-3-5-llmd-inference-pool
+          - --pool-namespace
+          - demo-ei
+          - --zap-encoder
+          - json
+          - --grpc-port
+          - "9002"
+          - --grpc-health-port
+          - "9003"
+          - --enable-cert-reload=true
+          - --secure-serving=true
+          - --model-server-metrics-scheme=https
+          - --cert-path=/var/run/kserve/tls
+          args:
+          - --config-text
+          - |
+            apiVersion: inference.networking.x-k8s.io/v1alpha1
+            kind: EndpointPickerConfig
+            plugins:
+            - type: single-profile-handler
+            - type: queue-scorer
+            - type: prefix-cache-scorer
+            - type: max-score-picker
+            schedulingProfiles:
+            - name: default
+              plugins:
+              - pluginRef: queue-scorer
+                weight: 2
+              - pluginRef: prefix-cache-scorer
+                weight: 3
+              - pluginRef: max-score-picker
+          env:
+          - name: SSL_CERT_DIR
+            value: /var/run/kserve/tls:/var/run/secrets/kubernetes.io/serviceaccount:/etc/pki/tls/certs
+          image: registry.redhat.io/rhoai/odh-llm-d-inference-scheduler-rhel9@sha256:bddf686d6eaf1a607e1c697f58165d685944607cb4629648f27e56b2884e3de0
+          resources:
+            requests:
+              cpu: 256m
+              memory: 500Mi
+          volumeMounts:
+          - mountPath: /var/run/kserve/tls
+            name: tls-certs
+            readOnly: true
+          - mountPath: /tmp/tokenizer
+            name: tokenizer-uds
+        - name: tokenizer
+          image: registry.redhat.io/rhoai/odh-llm-d-kv-cache-rhel9@sha256:db4b79a17194574aeae3e702eb2740485c95f160166d2ea7b6cbab0a40cfe9e9
+          env:
+          - name: TOKENIZERS_DIR
+            value: /mnt/models
+          workingDir: /mnt/models
+          resources:
+            requests:
+              cpu: 256m
+              memory: 500Mi
+          volumeMounts:
+          - mountPath: /tmp
+            name: tokenizer-tmp
+          - mountPath: /.cache
+            name: tokenizer-cache
+          - mountPath: /tmp/tokenizer
+            name: tokenizer-uds
+          - mountPath: /mnt/models/base
+            name: kserve-pvc-source
+            readOnly: true
+            subPath: mistral-medium-3-5
+        volumes:
+        - name: tls-certs
+          secret:
+            secretName: mistral-medium-3-5-llmd-kserve-self-signed-certs
+        - name: tokenizer-uds
+          emptyDir: {}
+        - name: tokenizer-tmp
+          emptyDir: {}
+        - name: tokenizer-cache
+          emptyDir: {}
+        - name: kserve-pvc-source
+          persistentVolumeClaim:
+            claimName: mistral-medium-3-5-bf16
+  template:
+    containers:
+    - env:
+      - name: VLLM_ADDITIONAL_ARGS
+        value: --tensor-parallel-size 8
+      name: main
+      resources:
+        limits:
+          cpu: "48"
+          memory: 320Gi
+          nvidia.com/gpu: "8"
+        requests:
+          cpu: "48"
+          memory: 320Gi
+          nvidia.com/gpu: "8"
+    # NON-STANDARD: toleration required for vLLM pod on GPU-tainted p4d node
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+```
+
+**Key facts:**
+- TLS secret name: `<llmisvc-name>-kserve-self-signed-certs` (auto-created by controller)
+- Pool name: `<llmisvc-name>-inference-pool` (hardcoded in EPP args)
+- Tokenizer container mounts the PVC at `/mnt/models/base` with `subPath=<model-subfolder>`
+- Image digests above are for RHOAI 3.4 — re-verify against the current release before reusing
+
+For PVC RWX (e.g. EFS), none of these workarounds are needed — the standard spec works as-is. AWS EFS supports ReadWriteMany, eliminating the co-location requirement entirely: EFS Standard runs 100-300 MB/s (2-3x slower model load than EBS gp3), EFS Performance up to 3 GB/s (comparable to EBS, more expensive). Runtime inference is unaffected either way since the model loads into GPU VRAM — the only cost is cold-start time.
 
 ---
 

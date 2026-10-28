@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: external-db-model-registry-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - env:
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              key: MYSQL_DATABASE
+              name: mysql-credentials
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: MYSQL_PASSWORD
+              name: mysql-credentials
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              key: MYSQL_USER
+              name: mysql-credentials
+        image: registry.redhat.io/rhel9/mysql-84:latest
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - MYSQL_PWD="$MYSQL_PASSWORD" mysqladmin -u $MYSQL_USER ping
+        name: mysql
+        ports:
+        - containerPort: 3306
+          name: mysql
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - MYSQL_PWD="$MYSQL_PASSWORD" mysqladmin -u $MYSQL_USER ping
+        resources:
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - mountPath: /var/lib/mysql/data
+          name: data
+        - mountPath: /opt/app-root/src/certs
+          name: certs
+          readOnly: true
+        - mountPath: /opt/app-root/src/mysql-cfg/ssl.cnf
+          name: ssl-cfg
+          subPath: ssl.cnf
+          readOnly: true
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: mysql
+      - name: certs
+        secret:
+          defaultMode: 0640
+          secretName: model-registry-lab-mysql-tls
+      - configMap:
+          name: model-registry-lab-mysql-ssl
+        name: ssl-cfg

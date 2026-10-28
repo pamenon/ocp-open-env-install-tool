@@ -7,8 +7,13 @@ metadata:
 spec:
   daemonsets: {}
   dcgm: {}
-  dcgmExporter: {}
-  devicePlugin: {}
+  dcgmExporter:
+    serviceMonitor:
+      enabled: true
+  devicePlugin:
+    config:
+      default: no-time-slicing
+      name: time-slicing-config
   driver:
     enabled: true
   gfd: {}

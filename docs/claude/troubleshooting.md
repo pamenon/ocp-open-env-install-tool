@@ -522,6 +522,61 @@ oc wait subscription.operators.coreos.com my-operator -n my-namespace --for=...
 - Bastion installation script (GitOps operator installation)
 - Cleanup Jobs (operator uninstallation)
 
+---
+
+### Cluster-Wide ImagePullBackOff - registry.redhat.io Rejects `:latest` Tag
+
+**Symptom**: Many unrelated Jobs/Deployments across the cluster simultaneously show `ImagePullBackOff`/`ErrImagePull`, all using the same base image
+
+**Root Cause**: `registry.redhat.io` can permanently retire the `:latest` tag on a given repo — this is a Red Hat registry policy decision, not a transient outage or an upstream bug that will get fixed
+
+**The Problem:**
+
+Pulling `registry.redhat.io/openshift4/ose-cli:latest` fails with:
+```
+unsupported: This repository does not use the "latest" tag to track the most recent
+image and must be pulled with an explicit version or image reference. For more
+information, see: https://access.redhat.com/articles/4301321
+```
+
+The `latest` tag still exists on the repo — `skopeo list-tags` still lists it — but the registry actively refuses to serve a manifest for it. Any manifest pinned to `:latest` on this repo will never recover on its own.
+
+**How to Diagnose:**
+
+```bash
+# Confirm every failing pod points at the same image
+oc get pods -A -o json | jq -r '.items[] | select(.status.phase!="Running" and .status.phase!="Succeeded") | .metadata.namespace + "/" + .metadata.name + " -> " + .spec.containers[0].image'
+
+# Confirm the registry, not the cluster, is the cause
+oc describe pod <pod> -n <ns> | grep -A2 "Failed.*pull"
+```
+
+**Solution — pin an explicit tag, and check the repo hasn't gone stale:**
+
+```bash
+# List tags (needs registry auth — this repo's own pull-secret.txt works)
+skopeo list-tags --authfile pull-secret.txt docker://registry.redhat.io/openshift4/ose-cli
+
+# If the repo's floating vX.Y tags stop at an old minor (confirmed: plain
+# "ose-cli" stops at v4.15), the image has moved to a RHEL9 successor repo:
+skopeo list-tags --authfile pull-secret.txt docker://registry.redhat.io/openshift4/ose-cli-rhel9 \
+  | jq -r '.Tags[]' | grep -E '^v4\.[0-9]+$'
+
+# Verify the chosen tag actually pulls before committing to it
+skopeo inspect --authfile pull-secret.txt docker://registry.redhat.io/openshift4/ose-cli-rhel9:v4.22
+```
+
+**Example Failure (fixed 2026-09-29):** 18 manifests across the repo (GitOps admin Jobs, `cert-manager` watchdog, `ai-project-a`/`ai-project-b` MCG rotation Jobs) all referenced `registry.redhat.io/openshift4/ose-cli:latest` and failed identically. `model-ingest-job` pods in both AI projects cascaded into `CreateContainerConfigError` (`secret "mcg-models" not found`) because the upstream `mcg-bucket-models-rotation` Job that creates that secret couldn't even start. Fix: repointed all 18 manifests to `registry.redhat.io/openshift4/ose-cli-rhel9:v4.22` — the maintained successor repo, which still publishes a floating `vX.Y` tag per OCP minor. `oc` client/server version skew is not a concern for these Jobs (basic `oc`/`jq` scripting only), so the pin doesn't need to track the cluster's exact patch version.
+
+**Prevention:**
+- ✅ Never reference `registry.redhat.io/...:latest` in any manifest — always pin an explicit tag
+- ✅ When bumping `OPENSHIFT_VERSION` in `config/common.config` across an OCP minor, re-check that `ose-cli-rhel9:vX.Y` exists for the new minor before assuming it does
+- ✅ A `latest` tag showing up in `skopeo list-tags` output does NOT mean it's pullable — registry-side pull rejection is independent of tag listing
+
+**Related Issues:**
+- Any Job/Deployment in this repo needing the `oc` CLI (currently pinned to `registry.redhat.io/openshift4/ose-cli-rhel9:v4.22`)
+- Any future image pinned to a Red Hat registry `:latest` tag elsewhere in the repo
+
 ### Partial Sync Cycles
 
 **Symptom**: Application repeatedly shows "Partial sync operation succeeded" every 5-6 minutes, health cycles between Healthy → Missing
@@ -1164,6 +1219,34 @@ oc get pods -n openshift-logging | grep loki
 - Loki ingester flush failures (caused by invalid credentials - see previous section)
 - LokiStack components not starting (waiting for valid storage secret)
 
+### maas-api CrashLoopBackOff - maas-db-config Secret in Wrong Namespace (RHOAI 3.5 Namespace Move)
+
+**Symptom**: `maas-api` pod in `redhat-ai-gateway-infra` stuck `CrashLoopBackOff`
+
+**Root Cause**: RHOAI 3.5 moved the MaaS infrastructure namespace from `redhat-ods-applications` to a dedicated `redhat-ai-gateway-infra` namespace (new `ai-gateway-operator`), but a Job/RBAC pair still targeted the old namespace for the `maas-db-config` secret.
+
+**Diagnose**:
+```bash
+oc logs deployment/maas-api -n redhat-ai-gateway-infra
+# error: failed to load database URL: failed to read secret
+# redhat-ai-gateway-infra/maas-db-config: secrets "maas-db-config" not found
+
+# Confirm the operator's own Config CR agrees:
+oc get configs.maas.opendatahub.io default -o jsonpath='{.status.conditions[0].message}'
+# ...MaasTenantConfig: database Secret 'maas-db-config' not found in namespace 'redhat-ai-gateway-infra'...
+
+# Confirm the infra namespace for your deployment (don't assume it's always redhat-ai-gateway-infra):
+oc get maastenantconfig default-tenant -n models-as-a-service -o jsonpath='{.status.infraNamespace}'
+```
+
+**Solution**: create `maas-db-config` in the namespace `MaasTenantConfig.status.infraNamespace` reports (`redhat-ai-gateway-infra` by default on 3.5+), not `redhat-ods-applications`. This repo's fix: `openshift-gitops-job-maas-db-secret.yaml` targets `redhat-ai-gateway-infra`, backed by `redhat-ai-gateway-infra-role-maas-db-secret.yaml` + `redhat-ai-gateway-infra-rb-maas-db-secret.yaml` (RBAC for the Job's `maas-db-secret` ServiceAccount — ArgoCD's own `rbac.authorization.k8s.io: '*'` ClusterRole rule already lets it create Role/RoleBinding in any namespace, no extra grant needed for that part).
+
+**Reference**: [RHOAI 3.5 docs, "Configure the database secret for Models-as-a-Service"](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/govern_llm_access_with_models-as-a-service/deploy-and-manage-models-as-a-service) — *"In OpenShift AI 3.5 and later, the maas-db-config secret is stored in the infrastructure namespace instead of the {dbd-config-default-namespace} namespace."*
+
+**Prevention**: after any RHOAI minor version bump, re-check `MaasTenantConfig.status.infraNamespace` and the release notes for namespace moves — this class of change ships without a CRD/API break, so nothing fails loudly at the GitOps sync level, only at pod runtime.
+
+---
+
 ### RHOAI Models as a Service Dashboard Not Showing Models
 
 **Symptom**: LLMInferenceServices with MaaS configuration do not appear in the RHOAI dashboard "AI asset endpoints → Models as a service" tab
@@ -1179,6 +1262,8 @@ oc get pods -n openshift-logging | grep loki
 ```
 
 **Affected Version**: RHOAI 3.3.0
+
+**⚠️ Namespace note for RHOAI 3.5+**: the debug commands below use `redhat-ods-applications`, correct for the 3.3.0 incident this section documents. From RHOAI 3.5 onward, `maas-api` and `maas-db-config` live in `redhat-ai-gateway-infra` instead — see `components.md`'s MaaS section. Substitute that namespace if debugging on 3.5+.
 
 **Root Cause**:
 The gen-ai-ui backend component cannot discover the maas-api service URL. Gen-ai-ui container logs show empty URL during initialization:
